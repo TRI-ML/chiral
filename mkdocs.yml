@@ -1,0 +1,58 @@
+site_name: Chiral
+site_description: Compact interface for robot policy evaluation
+repo_url: https://github.com/TRI-ML/chiral
+repo_name: TRI-ML/chiral
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.highlight
+    - content.code.copy
+    - content.tabs.link
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - tables
+  - attr_list
+  - def_list
+  - footnotes
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Guide:
+    - Server: guide/server.md
+    - Client: guide/client.md
+  - Reference:
+    - Types: reference/types.md
+    - Protocol: reference/protocol.md
+  - Examples:
+    - Python: examples/python.md
+    - Python (Zenoh): examples/zenoh.md
+    - C++: examples/cpp.md

@@ -1,0 +1,10 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# Only Eigen3 is a public dependency (appears in chiral's installed headers).
+# ixwebsocket and msgpack-cxx are private implementation details.
+find_dependency(Eigen3 3.4 REQUIRED)
+
+include("${CMAKE_CURRENT_LIST_DIR}/chiralTargets.cmake")
+check_required_components(chiral)
