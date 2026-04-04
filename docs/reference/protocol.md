@@ -40,16 +40,19 @@ payload = data[4 + hlen :]
 
 ## Message Types
 
-There are six message types in total. Three are sent from the client to the server; three are sent from the server to the client.
+There are seven message types. Four are sent from the client to the server; three are sent from the server to the client.
 
 | Direction | Type | msgpack header | Payload |
 |-----------|------|----------------|---------|
 | Client → Server | `metadata` | `{"type": "metadata"}` | _(empty)_ |
 | Client → Server | `reset` | `{"type": "reset"}` | _(empty)_ |
-| Client → Server | `action` | `{"type": "action", "shape": [N, D], "dtype": "float32"}` | N×D float32 values (row-major) |
+| Client → Server | `obs_request` | `{"type": "obs_request"}` | _(empty)_ |
+| Client → Server | `apply_action` | `{"type": "apply_action", "shape": [D], "dtype": "float32", "obs_timestamps": {...}}` | D float32 values |
 | Server → Client | `metadata_response` | `{"type": "metadata_response", "data": {...}}` | _(empty)_ |
 | Server → Client | `reset_response` | observation fields + `{"info": {...}}` | images + depths + proprios |
-| Server → Client | `step_response` | observation fields + `{"reward": f, "terminated": b, "truncated": b, "info": {...}}` | images + depths + proprios |
+| Server → Client | `obs_response` | observation fields | images + depths + proprios |
+
+`apply_action` is **fire-and-forget** — the server calls `apply_action()` and sends no response. This keeps the obs stream and action dispatch fully independent.
 
 ### metadata / metadata_response
 
@@ -63,34 +66,35 @@ The client sends `{"type": "metadata"}` with no payload. The server responds wit
 
 The client sends `{"type": "reset"}` with no payload. The server calls its `reset()` method and responds with a full observation frame (see below) whose type is `"reset_response"`.
 
-### action / step_response
+### obs_request / obs_response
 
-The client sends an action:
+The client sends `{"type": "obs_request"}` with no payload. The server calls `get_obs()` (default: `_make_obs()`) and responds with an observation frame of type `"obs_response"`. Used by `start_obs_stream` to continuously poll the server at a fixed Hz.
+
+### apply_action (fire-and-forget)
+
+The client sends a single action slice:
 
 ```
-header: {"type": "action", "shape": [1, 7], "dtype": "float32"}
+header: {"type": "apply_action", "shape": [7], "dtype": "float32", "obs_timestamps": {"wrist_cam": 1.23}}
 payload: 7 × 4 = 28 bytes of float32 data
 ```
 
-The server decodes the action, calls `step()`, and responds with a full observation frame of type `"step_response"`.
+The server decodes the action, calls `apply_action()`, and sends **no response**. The `obs_timestamps` map carries the camera timestamps of the observation that was used to predict this action (useful for latency measurement).
 
 ---
 
 ## Observation Frame Header
 
-Both `reset_response` and `step_response` use the same observation frame structure. The msgpack header for an observation frame contains these top-level keys:
+Both `reset_response` and `obs_response` use the same observation frame structure. The msgpack header for an observation frame contains these top-level keys:
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `type` | `string` | `"reset_response"` or `"step_response"` |
+| `type` | `string` | `"reset_response"` or `"obs_response"` |
 | `timestamp` | `float` | Application timestamp set by `make_obs(timestamp)` |
 | `cameras` | `array` | One entry per camera (see below) |
 | `proprios` | `array` | One entry per proprio stream (see below) |
 | `extra` | `map` | Extra fields from `Observation.extra` (Python only; empty in C++) |
-| `info` | `map` | Step info dict from `reset()` / `step()` return value |
-| `reward` | `float` | Scalar reward _(step_response only)_ |
-| `terminated` | `bool` | Episode terminated flag _(step_response only)_ |
-| `truncated` | `bool` | Episode truncated flag _(step_response only)_ |
+| `info` | `map` | Info dict from `reset()` return value _(reset_response only)_ |
 
 ### Camera Entries
 
@@ -166,23 +170,21 @@ The only practical difference is that C++ `InfoMap` values are always strings, w
 
 ---
 
-## Example: step_response Frame
+## Example: obs_response Frame
 
-Below is a concrete example of a `step_response` frame for a server with one RGB+depth camera (`480×640×3`, `uint8`/`float32`) and one proprio stream (`joint_pos`, 7 elements):
+Below is a concrete example of an `obs_response` frame for a server with one RGB+depth camera (`480×640×3`, `uint8`/`float32`) and one proprio stream (`joint_pos`, 7 elements):
 
 ```
 Offset  Length  Contents
 ------  ------  --------
 0       4       header_len = <N> (little-endian uint32)
 4       N       msgpack map:
-                  type        = "step_response"
+                  type        = "obs_response"
                   timestamp   = 0.05
-                  reward      = 0.0
-                  terminated  = false
-                  truncated   = false
-                  info        = {}
+                  extra       = {}
                   cameras[0]:
                     name         = "wrist_cam"
+                    timestamp    = 1.234          (camera capture time)
                     intrinsics   = [600,0,320,0,600,240,0,0,1]   (9 float64)
                     extrinsics   = [1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]  (16 float64)
                     image_shape  = [480, 640, 3]

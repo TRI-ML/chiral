@@ -1,12 +1,12 @@
 # Server Guide
 
-The server runs on the robot or simulator side; it owns the sensor hardware and the environment state. The client drives the loop by sending `reset` and `step` requests; the server responds with observations.
+The server runs on the robot side; it owns the sensor hardware and the environment state. The client connects, calls `reset()` to start an episode, then independently polls for observations and dispatches actions at fixed rates.
 
 ---
 
 ## Threading Model
 
-The server runs **one network thread** (the asyncio event loop) that handles WebSocket messages. When the client sends a `step` action, the network thread calls your `step()` implementation, which calls `make_obs()` / `_make_obs()` to snapshot the current sensor state.
+The server runs **one network thread** (the asyncio event loop) that handles WebSocket messages. When the client sends an `obs_request`, the network thread calls `get_obs()` to snapshot the current sensor state. When the client sends an `apply_action`, the network thread calls `apply_action()` with no response.
 
 Meanwhile, **one or more sensor threads** run independently: a camera capture thread reads frames from the hardware at 30 Hz; a proprioception thread reads joint state at 500 Hz. These threads write into the pre-allocated buffers using the `update_*` helpers.
 
@@ -20,8 +20,8 @@ The key invariant is that a sensor thread and the network thread must never corr
                 └────────────────────┬────────────┘
                                      │ same mutex
                 ┌────────────────────▼────────────┐
-  network thread│  make_obs() / _make_obs()        │
-  (on step)     │  (acquire cam_mutex_[i])         │──► Observation snapshot
+  network thread│  get_obs() / make_obs()          │
+  (on obs_req)  │  (acquire cam_mutex_[i])         │──► Observation snapshot
                 └─────────────────────────────────┘
 ```
 
@@ -416,9 +416,9 @@ Updates a proprioception buffer. The vector length must match the `size` declare
 
 ---
 
-## Step 5 — Implement reset and step
+## Step 5 — Implement reset, get_obs, and apply_action
 
-With the sensor threads running, `reset()` and `step()` are straightforward. Both simply call `_make_obs(timestamp)` to take a consistent snapshot of all buffers, then return the result.
+With the sensor threads running, `reset()`, `get_obs()`, and `apply_action()` are straightforward.
 
 `_make_obs()` / `make_obs()` acquires each camera's mutex in declaration order, copies the four buffers (image, depth, intrinsics, extrinsics) into a new `CameraInfo`, releases the mutex, and moves on to the next camera. It then does the same for each proprio stream. The result is an `Observation` where all buffers represent a single coherent point in time.
 
@@ -435,43 +435,38 @@ With the sensor threads running, `reset()` and `step()` are straightforward. Bot
         obs = self._make_obs(timestamp=0.0)
         return obs, {}
 
-    async def step(
-        self, action: np.ndarray
-    ) -> tuple[chiral.Observation, float, bool, bool, dict]:
-        # action is a (N, D) float32 ndarray decoded from the client message.
-        # Execute the action on the robot hardware.
+    async def get_obs(self) -> chiral.Observation:
+        # Called by the client obs stream thread at a fixed Hz.
+        # Default implementation just calls _make_obs().
+        # Override to block until a fresh camera frame has arrived, or to
+        # assemble the observation from non-default sources.
+        return self._make_obs(timestamp=self._step_count * 0.05)
+
+    async def apply_action(self, action: np.ndarray) -> None:
+        # action is a (D,) float32 ndarray decoded from the client message.
+        # Execute the action on the robot hardware; no response is sent.
         robot.apply_action(action)
-
-        # Snapshot sensor state with the current wall-clock timestamp.
-        timestamp = self._step_count * 0.05  # or time.time()
-        obs = self._make_obs(timestamp=timestamp)
-
-        reward = compute_reward(obs)
         self._step_count += 1
-        terminated = self._step_count >= 200
-
-        return obs, reward, terminated, False, {}
     ```
 
 === "C++"
 
+    > **Note:** The C++ server still uses the legacy coupled `step()` API.
+
     ```cpp
     std::pair<chiral::Observation, chiral::InfoMap> reset() override {
         step_ = 0;
-        // Snapshot the current sensor state at timestamp 0.
         return {make_obs(0.0), {}};
     }
 
     chiral::StepResult step(const chiral::Action& action) override {
-        // action.data is a vector<float> of length action.N * action.D
         robot.apply_action(action.data);
 
         chiral::StepResult r;
-        r.obs        = make_obs(step_ * 0.05);   // snapshot all buffers
-        r.reward     = compute_reward(r.obs);
+        r.obs        = make_obs(step_ * 0.05);
+        r.reward     = 0.f;
         r.terminated = ++step_ >= 200;
         r.truncated  = false;
-        r.info       = {};
         return r;
     }
     ```
@@ -519,7 +514,7 @@ With the sensor threads running, `reset()` and `step()` are straightforward. Bot
 
 ### Alternative: Zenoh transport
 
-Pass `protocol="zenoh"` to use Zenoh over TCP instead of WebSocket. All other code — `camera_configs`, `reset`, `step`, the `update_*` helpers — stays unchanged.
+Pass `protocol="zenoh"` to use Zenoh over TCP instead of WebSocket. All other code — `camera_configs`, `reset`, `get_obs`, `apply_action`, the `update_*` helpers — stays unchanged.
 
 === "Python"
 
@@ -621,10 +616,12 @@ The default port for Zenoh is `7447`. The WebSocket default (`8765`) is unchange
             self._step = 0
             return self._make_obs(), {}
 
-        async def step(self, action):
-            obs = self._make_obs(timestamp=self._step * 0.05)
+        async def get_obs(self):
+            return self._make_obs(timestamp=self._step * 0.05)
+
+        async def apply_action(self, action):
+            # robot.send_joint_command(action)
             self._step += 1
-            return obs, 0.0, self._step >= 200, False, {}
 
     if __name__ == "__main__":
         MinimalServer().run()

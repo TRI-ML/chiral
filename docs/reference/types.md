@@ -286,7 +286,7 @@ Snapshot of all sensor data at one point in time. Returned by `reset()` and `ste
 
 ## Action (C++ only)
 
-Encodes a policy action to send to the server. In Python, actions are plain `np.ndarray` values passed directly to `env.step()`.
+Encodes a policy action to send to the server. In Python, actions are plain `np.ndarray` values passed to `env.put_action()`.
 
 ```cpp
 struct Action {
@@ -329,7 +329,7 @@ a.data.assign(mat.data(), mat.data() + mat.size());
 
 ## StepResult (C++ only)
 
-Returned by `PolicyClient::step()`. In Python, `env.step()` returns a plain 5-tuple `(obs, reward, terminated, truncated, info)`.
+Returned by `PolicyClient::step()` in the C++ legacy API. The Python client does not have a `step()` method; observations and actions flow on independent channels via `start_obs_stream` / `start_action_dispatch`.
 
 ```cpp
 struct StepResult {

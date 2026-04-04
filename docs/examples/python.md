@@ -181,31 +181,40 @@ Returns the list of camera names and the expected action shape. The client reads
 
 Resets the step counter and timing accumulator, then snapshots the current sensor state with `_make_obs()`. The second return value is an info dict (empty here). In a real system, you would also command the robot to its home configuration before returning.
 
-### step
+### get_obs
 
 ```python
-    async def step(self, action: np.ndarray) -> tuple[chiral.Observation, float, bool, bool, dict]:
+    async def get_obs(self) -> chiral.Observation:
+        """Return a snapshot of the current sensor state."""
+        return self._make_obs()
+```
+
+Called by the client's obs stream thread at a fixed Hz. `_make_obs()` acquires each camera's mutex in turn, copies the four buffers (image, depth, intrinsics, extrinsics) into new arrays, and releases the mutex before moving to the next camera. The result is a consistent snapshot even though sensor threads may be writing concurrently.
+
+The default base-class implementation already calls `_make_obs()`, so this override is explicit for clarity. Override to block until a fresh hardware frame has arrived if strict frame-freshness guarantees are needed.
+
+### apply_action
+
+```python
+    async def apply_action(self, action: np.ndarray) -> None:
+        """Receive one action slice from the client and apply it to the robot."""
         t0 = time.perf_counter()
 
-        # _make_obs() snapshots all camera and proprio buffers under their locks.
-        obs = self._make_obs(timestamp=self._step * 0.05)
+        # ── hardware command goes here ─────────────────────────────────────
+        # robot.send_joint_command(action)
+        # ──────────────────────────────────────────────────────────────────
 
         step_ms = (time.perf_counter() - t0) * 1e3
         self._step  += 1
         self._t_sum += step_ms
 
-        if self._step % 10 == 0:
-            print(f"step={self._step:4d}  "
-                  f"server_step={step_ms:5.2f}ms  "
-                  f"avg={self._t_sum / self._step:5.2f}ms")
-
-        terminated = self._step >= 200
-        return obs, 0.0, terminated, False, {}
+        print(f"action={self._step:4d}  "
+              f"apply={step_ms:5.2f}ms  "
+              f"avg={self._t_sum / self._step:5.2f}ms",
+              flush=True)
 ```
 
-`_make_obs(timestamp)` is the key call. It acquires each camera's mutex in turn, copies the four buffers (image, depth, intrinsics, extrinsics) into new arrays, and releases the mutex before moving to the next camera. The result is a consistent snapshot even though sensor threads may be writing concurrently.
-
-The timestamp is set to `step * 0.05`, representing 50 ms per step (20 Hz control). The episode ends after 200 steps (`terminated = True`). In a real system you would also apply `action` to the robot here.
+Called by the client's action dispatch thread at the configured Hz. No observation is returned — this is fire-and-forget. The client dispatches actions independently of obs polling so the two channels never block each other.
 
 ### Entrypoint
 
@@ -222,105 +231,90 @@ if __name__ == "__main__":
 
 **File:** `examples/python/client_example.py`
 
-The client connects to the server, calls `reset()`, and then steps through the episode. A `tqdm` progress bar displays a rolling latency summary (current, mean, p95) and fps updated every step. A full percentile breakdown is printed at the end.
+The client connects to the server, calls `reset()`, starts an obs stream and action dispatch thread, then runs a policy loop that reads the latest observation and enqueues action chunks.
 
-### Imports
+### Imports and Constants
 
 ```python
-"""Example policy client.
-
-Start server_example.py first, then run this:
-
-    uv run examples/python/server_example.py &
-    uv run examples/python/client_example.py
-"""
 import time
-from collections import deque
+import threading
 
 import numpy as np
-from tqdm import tqdm
 import chiral
+
+ACTION_HZ    = 10    # Hz at which actions are dispatched to the robot
+OBS_HZ       = 30   # Hz at which observations are fetched from the server
+CHUNK_SIZE   = 10   # number of actions predicted per policy call
+DOF          = 7
+TOTAL_STEPS  = 200  # actions to dispatch before stopping
 ```
 
-### Connection and Metadata
+`CHUNK_SIZE` matches the prediction horizon of the policy — e.g. a diffusion policy might predict 10 future actions at once, all of which are enqueued and then dispatched at `ACTION_HZ`.
+
+### Policy Loop
 
 ```python
-if __name__ == "__main__":
-    with chiral.PolicyClient("ws://localhost:8765") as env:
-        meta = env.get_metadata()
-        cameras      = meta.get("cameras", [])
-        action_shape = meta.get("action_shape", [1, 7])
-        print(f"cameras: {cameras}  action_shape: {action_shape}\n")
+def policy_loop(env: chiral.PolicyClient, stop: threading.Event) -> None:
+    inference_count = 0
+    while not stop.is_set():
+        obs = env.latest_obs
+        if obs is None:
+            time.sleep(0.01)
+            continue
+
+        # Show that real observation data is arriving.
+        cam_info = ", ".join(
+            f"{c.name}@{c.timestamp:.3f}s img={c.image.shape}"
+            for c in obs.cameras[:2]
+        )
+        print(f"[policy #{inference_count}] obs ts={obs.timestamp:.3f}  cameras: {cam_info}")
+
+        # Replace with real model inference:
+        actions = np.zeros((CHUNK_SIZE, DOF), dtype=np.float32)
+
+        for a in actions:
+            env.put_action(a)
+
+        inference_count += 1
+        time.sleep(CHUNK_SIZE / ACTION_HZ * 0.9)
 ```
 
-`PolicyClient` is used as a context manager: `__enter__` calls `connect()` and `__exit__` calls `close()`. The `connect()` call polls until the server accepts the WebSocket handshake, so you can start this script immediately after the server — it will wait automatically.
+`env.latest_obs` is updated by the obs stream thread without blocking the policy loop. Once a non-None observation is available, inference runs and all predicted actions are enqueued via `put_action`. The `time.sleep` paces the policy loop so the queue doesn't grow unboundedly — in practice this is bounded by GPU compute time.
 
-`get_metadata()` returns the dict from the server's `get_metadata()` override. Here we extract the camera list and action shape to configure the loop.
-
-### Reset
+### Connection, Reset, and Streaming Startup
 
 ```python
-        obs, info = env.reset()
-        total_reward = 0.0
-        step         = 0
-        t_episode    = time.perf_counter()
+with chiral.PolicyClient("ws://localhost:8765") as env:
+    obs, info = env.reset()
+
+    env.start_obs_stream(hz=OBS_HZ)
+    env.start_action_dispatch(hz=ACTION_HZ)
 ```
 
-`reset()` sends a `reset` message and blocks until the `reset_response` arrives. The response includes a full observation with all camera images, depths, intrinsics, extrinsics, and proprio data.
+`reset()` is called once to start the episode. `start_obs_stream` launches a background coroutine on the client's asyncio loop that polls `obs_request` / `obs_response` at `OBS_HZ`. `start_action_dispatch` launches a background coroutine that dequeues one action per tick from `_action_queue` and sends it as `apply_action` (fire-and-forget).
 
-### Episode Loop
+### Running and Stopping
 
 ```python
-        while True:
-            # Replace with real policy inference.
-            action = np.zeros(action_shape, dtype=np.float32)
+    stop = threading.Event()
+    policy_thread = threading.Thread(target=policy_loop, args=(env, stop), daemon=True)
+    policy_thread.start()
+
+    t_start = time.perf_counter()
+    dispatched = 0
+    while dispatched < TOTAL_STEPS:
+        time.sleep(1 / ACTION_HZ)
+        dispatched += 1
+
+    stop.set()
+    policy_thread.join()
+
+    elapsed = time.perf_counter() - t_start
+    print(f"\ndispatched {TOTAL_STEPS} actions in {elapsed:.1f}s  "
+          f"({TOTAL_STEPS / elapsed:.1f} Hz)")
 ```
 
-The action is constructed as zeros here. In a real policy this would be the output of your neural network inference step — e.g. `action = model.forward(obs)`.
-
-### Stepping and Latency Measurement
-
-```python
-            t0 = time.perf_counter()
-            obs, reward, terminated, truncated, info = env.step(action)
-            latency_ms = (time.perf_counter() - t0) * 1e3
-
-            step += 1
-            latencies.append(latency_ms)
-            window.append(latency_ms)
-            fps = step / (time.perf_counter() - t_episode)
-
-            w = np.array(window)
-            pbar.set_postfix(
-                lat=f"{latency_ms:.0f}ms",
-                mean=f"{w.mean():.0f}ms",
-                p95=f"{np.percentile(w, 95):.0f}ms",
-                fps=f"{fps:.1f}",
-            )
-            pbar.update(1)
-```
-
-`env.step(action)` serializes the action as float32 bytes, sends it, and blocks until the `step_response` arrives. `latency_ms` is the full round-trip: serialize → send → server processes → receive → deserialize.
-
-The `tqdm` bar is updated every step with the current latency, a rolling mean and p95 over the last 20 steps, and throughput. All latencies are also accumulated in `latencies` for the final summary.
-
-### Episode Summary
-
-```python
-        arr = np.array(latencies)
-        fps = step / (time.perf_counter() - t_episode)
-        print(f"\n── episode summary ──────────────────────────────")
-        print(f"steps={step}  avg_fps={fps:.1f}")
-        print(f"mean={arr.mean():.1f}ms  median={np.median(arr):.1f}ms")
-        print(f"min={arr.min():.1f}ms   max={arr.max():.1f}ms")
-        print(f"p95={np.percentile(arr, 95):.1f}ms  p99={np.percentile(arr, 99):.1f}ms")
-```
-
-Printed once after the `with tqdm(...)` block exits. Reports mean, median, min, max, p95, and p99 latency across the full episode.
-
-### Termination
-
-The loop ends when the server sets `terminated=True` (after 200 steps in the example).
+The main thread counts dispatched actions and stops after `TOTAL_STEPS`. `close()` (called by the context manager `__exit__`) automatically cancels the obs stream and action dispatch tasks.
 
 ---
 
@@ -330,23 +324,20 @@ Running both scripts should produce output similar to:
 
 **Server terminal:**
 ```
-step=   1  server_step= 0.12ms  avg= 0.12ms
-step=   2  server_step= 0.11ms  avg= 0.12ms
+action=   1  apply= 0.01ms  avg= 0.01ms
+action=   2  apply= 0.01ms  avg= 0.01ms
 ...
-step= 200  server_step= 0.11ms  avg= 0.11ms
+action= 200  apply= 0.01ms  avg= 0.01ms
 ```
 
 **Client terminal:**
 ```
 cameras: ['cam_0', ..., 'cam_7']  action_shape: [1, 7]
 
- 200/? [00:38<00:00,  5.2step/s, lat=189ms, mean=191ms, p95=210ms, fps=5.2]
-
-── episode summary ──────────────────────────────
-steps=200  avg_fps=5.2
-mean=191.3ms  median=190.1ms
-min=178.4ms   max=241.2ms
-p95=210.5ms  p99=228.7ms
+[policy #0] obs ts=0.000  cameras: cam_0@1.234s img=(480, 640, 3), cam_1@1.234s img=(480, 640, 3)
+[policy #1] obs ts=0.000  cameras: cam_0@1.268s img=(480, 640, 3), cam_1@1.268s img=(480, 640, 3)
+...
+dispatched 200 actions in 20.0s  (10.0 Hz)
 ```
 
 !!! tip "Interpreting latency"

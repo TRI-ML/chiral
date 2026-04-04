@@ -7,21 +7,21 @@
 
 Compact interface for robot policy evaluation.
 
-Sensor observations — RGB images, depth maps, camera intrinsics, camera extrinsics, and proprioception — are streamed from an environment **server** to a **policy client** in a separate process. The client exposes a gym-like `reset` / `step` interface; the server implements matching abstract methods. All communication is handled by the library; only application logic needs to be implemented.
+Sensor observations — RGB images, depth maps, camera intrinsics, camera extrinsics, and proprioception — are streamed from a robot **server** to a **policy client** in a separate process. Observations and actions flow on independent channels so chunked policy predictions never stall waiting for camera data. All communication is handled by the library; only application logic needs to be implemented.
 
 ---
 
 ## Architecture
 
 ```
-  ┌─────────────────┐   obs / reward   ┌──────────────────┐
-  │  PolicyServer   │ ───────────────► │  PolicyClient    │
-  │  (robot / env)  │                  │  (policy / model)│
-  │                 │ ◄─────────────── │                  │
-  └─────────────────┘  reset / action  └──────────────────┘
+  ┌─────────────────┐   obs stream (30 Hz)    ┌──────────────────┐
+  │  PolicyServer   │ ──────────────────────► │  PolicyClient    │
+  │  (robot side)   │                         │  (policy side)   │
+  │                 │ ◄────────────────────── │                  │
+  └─────────────────┘  action dispatch (10Hz) └──────────────────┘
 ```
 
-The server runs on the robot (or simulator) side. When the client calls `reset()`, the server resets the environment and returns the first observation. The client then runs its policy in a loop: it calls `step(action)` on each iteration and receives a new observation, reward, and termination flags.
+The server runs on the robot side. The client connects, calls `reset()` once to start an episode, then runs three concurrent threads: one that continuously polls for the latest observation, one that runs policy inference and enqueues action chunks, and one that dispatches actions to the robot at a fixed Hz.
 
 ---
 
@@ -66,9 +66,8 @@ The server runs on the robot (or simulator) side. When the client calls `reset()
         async def reset(self):
             return self._make_obs(), {}
 
-        async def step(self, action):
-            obs = self._make_obs()
-            return obs, 0.0, False, False, {}
+        async def apply_action(self, action):
+            pass  # send action to robot hardware
 
     MyServer().run()
     ```
@@ -76,18 +75,30 @@ The server runs on the robot (or simulator) side. When the client calls `reset()
     **Client (policy side)**
 
     ```python
+    import threading
     import numpy as np
     import chiral
 
+    def policy_loop(env, stop):
+        while not stop.is_set():
+            obs = env.latest_obs
+            if obs is None:
+                continue
+            print(obs["wrist_cam"].image.shape, obs["wrist_cam"].intrinsics)
+            actions = np.zeros([8, 7], dtype=np.float32)  # chunked predictions
+            for a in actions:
+                env.put_action(a)
+
     with chiral.PolicyClient("ws://localhost:8765") as env:
         obs, info = env.reset()
+        env.start_obs_stream(hz=30)
+        env.start_action_dispatch(hz=10)
 
-        for _ in range(100):
-            action = np.zeros([1, 7], dtype=np.float32)
-            obs, reward, terminated, truncated, info = env.step(action)
-            print(obs["wrist_cam"].image.shape, obs["wrist_cam"].intrinsics)
-            if terminated or truncated:
-                break
+        stop = threading.Event()
+        t = threading.Thread(target=policy_loop, args=(env, stop))
+        t.start()
+        # ... run for desired duration, then:
+        stop.set(); t.join()
     ```
 
 === "C++"
@@ -124,6 +135,7 @@ The server runs on the robot (or simulator) side. When the client calls `reset()
             return {make_obs(0.0), {}};
         }
 
+        // C++ still uses the legacy coupled step() API
         chiral::StepResult step(const chiral::Action&) override {
             chiral::StepResult r;
             r.obs = make_obs(); r.reward = 0.f;

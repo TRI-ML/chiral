@@ -6,14 +6,14 @@
 
 Compact interface for robot policy evaluation. **[Documentation](https://tri-ml.github.io/chiral/)**
 
-Sensor observations (images, depth maps, camera intrinsics/extrinsics) are streamed from a **server** to a **policy client** in a separate process. The client exposes a gym-like `reset` / `step` interface; the server implements the matching abstract methods. Communication is handled by this library, and only application logic needs to be implemented.
+Sensor observations (images, depth maps, camera intrinsics/extrinsics, proprioception) are streamed from a robot **server** to a **policy client** in a separate process. Observations and actions flow on independent channels so chunked policy predictions never stall waiting for camera data.
 
 ```
-  ┌─────────────────┐   obs / reward   ┌──────────────────┐
-  │  PolicyServer   │ ───────────────► │  PolicyClient    │
-  │  (robot / env)  │                  │  (policy / model)│
-  │                 │ ◄─────────────── │                  │
-  └─────────────────┘  reset / action  └──────────────────┘
+  ┌─────────────────┐   obs stream (30 Hz)   ┌──────────────────┐
+  │  PolicyServer   │ ─────────────────────► │  PolicyClient    │
+  │  (robot side)   │                        │  (policy side)   │
+  │                 │ ◄───────────────────── │                  │
+  └─────────────────┘  action dispatch(10Hz) └──────────────────┘
 ```
 
 One-to-one connection. No compression. Numpy arrays are transmitted as raw bytes using msgpack to minimize latency. Python and C++ share the same wire format, so cross-language pairs work.
@@ -55,7 +55,7 @@ target_link_libraries(my_target chiral)
 
 ### Server (robot side)
 
-Subclass `PolicyServer` and implement `camera_configs`, `reset`, and `step`. The base class pre-allocates one buffer and one `threading.Lock` per camera for images, depths, intrinsics, and extrinsics. Sensor threads write via the `update_*` helpers; `_make_obs()` snapshots everything consistently under each camera's lock.
+Subclass `PolicyServer` and implement `camera_configs`, `reset`, and `apply_action`. The base class pre-allocates one buffer and one `threading.Lock` per camera for images, depths, intrinsics, and extrinsics. Sensor threads write via the `update_*` helpers; `_make_obs()` snapshots everything consistently under each camera's lock.
 
 ```python
 import threading, time
@@ -106,9 +106,11 @@ class MyServer(chiral.PolicyServer):
     async def reset(self) -> tuple[chiral.Observation, dict]:
         return self._make_obs(timestamp=0.0), {}
 
-    async def step(self, action: np.ndarray) -> tuple[chiral.Observation, float, bool, bool, dict]:
-        obs = self._make_obs(timestamp=...)   # snapshots all buffers under their locks
-        return obs, reward, terminated, truncated, {}
+    # get_obs() is inherited — default snapshots _make_obs() under camera locks.
+    # Override if you need to block until a fresh frame arrives.
+
+    async def apply_action(self, action: np.ndarray) -> None:
+        robot.send_joint_command(action)   # fire-and-forget; no obs returned
 
 MyServer().run()
 ```
@@ -129,27 +131,45 @@ For async contexts use `await server.serve()` instead of `.run()`.
 
 ### Client (policy / inference side)
 
-`PolicyClient` is a concrete class with a gym-like interface.
+`PolicyClient` streams observations and dispatches actions on independent background threads, so chunked policy predictions never stall waiting for camera data.
 
 ```python
+import threading
 import numpy as np
 import chiral
+
+def policy_loop(env, stop):
+    while not stop.is_set():
+        obs = env.latest_obs           # latest obs from the obs stream thread
+        if obs is None:
+            continue
+        actions = policy(obs)          # (N, D) float32 — chunked predictions
+        for a in actions:
+            env.put_action(a)          # enqueue; dispatched at fixed Hz
 
 with chiral.PolicyClient("ws://localhost:8765") as env:
     meta = env.get_metadata()          # {"action_shape": [1, 7], "cameras": [...]}
     obs, info = env.reset()
 
-    while True:
-        cam   = obs["wrist_cam"]   # look up by name; raises KeyError if missing
-        image = cam.image          # (H, W, 3) uint8
-        depth = cam.depth          # (H, W) float32, or None
-        K     = cam.intrinsics     # (3, 3) float64
-        T     = cam.extrinsics     # (4, 4) float64
+    env.start_obs_stream(hz=30)        # thread 1: keeps latest_obs fresh
+    env.start_action_dispatch(hz=10)   # thread 3: sends queued actions at 10 Hz
 
-        action = policy(obs)       # (N, D) float32
-        obs, reward, terminated, truncated, info = env.step(action)
-        if terminated or truncated:
-            break
+    stop = threading.Event()
+    t = threading.Thread(target=policy_loop, args=(env, stop))
+    t.start()
+    # ... run for desired duration, then:
+    stop.set(); t.join()
+```
+
+Observations can be accessed from any camera by name:
+
+```python
+obs = env.latest_obs
+cam   = obs["wrist_cam"]   # raises KeyError if missing
+image = cam.image          # (H, W, 3) uint8
+depth = cam.depth          # (H, W) float32, or None
+K     = cam.intrinsics     # (3, 3) float64 — fresh every obs
+T     = cam.extrinsics     # (4, 4) float64 — fresh every obs
 ```
 
 `obs.cameras` is a plain list for iteration.
@@ -250,7 +270,7 @@ On the client: `obs["wrist_cam"].intrinsics`, `.extrinsics`, `.image` and `obs.p
 
 ### Client
 
-`PolicyClient` is a concrete class with a gym-like interface.
+> **Note:** The C++ client still uses the legacy coupled `step()` API and has not yet been updated to the decoupled streaming design.
 
 ```cpp
 #include <chiral/client.hpp>
@@ -292,14 +312,15 @@ Every frame:
 [4 bytes LE: header_len] [header_len bytes: msgpack] [raw payload bytes]
 ```
 
-| Direction        | Type                | Payload                                        |
-|------------------|---------------------|------------------------------------------------|
-| Client → Server  | `metadata`          | _(empty)_                                      |
-| Client → Server  | `reset`             | _(empty)_                                      |
-| Client → Server  | `action`            | float32 buffer `[N×D]`                         |
-| Server → Client  | `metadata_response` | _(empty)_; header carries `data` dict          |
-| Server → Client  | `reset_response`    | images + depths + proprios; header has camera/proprio metadata + `info` |
-| Server → Client  | `step_response`     | images + depths + proprios; header adds `reward`, `terminated`, `truncated`, `info` |
+| Direction        | Type                | Payload                                                                  |
+|------------------|---------------------|--------------------------------------------------------------------------|
+| Client → Server  | `metadata`          | _(empty)_                                                                |
+| Client → Server  | `reset`             | _(empty)_                                                                |
+| Client → Server  | `obs_request`       | _(empty)_                                                                |
+| Client → Server  | `apply_action`      | float32 buffer `[D]` — fire-and-forget, no server response               |
+| Server → Client  | `metadata_response` | _(empty)_; header carries `data` dict                                    |
+| Server → Client  | `reset_response`    | images + depths + proprios; header has camera/proprio metadata + `info`  |
+| Server → Client  | `obs_response`      | images + depths + proprios; header has camera/proprio metadata           |
 
 Camera metadata (name, intrinsics, extrinsics, shape, dtype, byte offset/size) and proprio metadata (name, dtype, byte offset/size) live in the msgpack header; all raw buffers are appended to the payload in order.
 

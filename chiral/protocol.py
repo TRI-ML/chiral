@@ -3,18 +3,21 @@ Binary protocol (no compression):
     [4 bytes LE: header_len] [header_len bytes: msgpack] [raw payload bytes]
 
 Client → Server:
-    metadata : {"type": "metadata"}
-    reset    : {"type": "reset"}
-    action   : {"type": "action", "shape": [N,D], "dtype": str}  + float32 payload
+    metadata     : {"type": "metadata"}
+    reset        : {"type": "reset"}
+    obs_request  : {"type": "obs_request"}
+    apply_action : {"type": "apply_action", "shape": [D], "dtype": str} + float32 payload
+                   (fire-and-forget — server sends no response)
 
 Server → Client:
     metadata_response : {"type": "metadata_response", "data": dict}
     reset_response    : obs fields + {"info": dict}
-    step_response     : obs fields + {"reward": f, "terminated": b, "truncated": b, "info": dict}
+    obs_response      : obs fields
 
 Obs fields: type, timestamp, extra, cameras[{name, intrinsics(9), extrinsics(16),
     image_shape, image_dtype, image_offset, image_size,
-    depth_shape?, depth_dtype?, depth_offset?, depth_size?}]
+    depth_shape?, depth_dtype?, depth_offset?, depth_size?}],
+    proprios[{name, dtype, offset, size}]
 """
 import struct
 
@@ -167,13 +170,31 @@ def decode_reset_response(data: bytes) -> tuple[Observation, dict]:
     return obs, header.get("info", {})
 
 
-# ── step ──────────────────────────────────────────────────────────────────────
+# ── obs_request / obs_response ────────────────────────────────────────────────
 
-def encode_action(action: np.ndarray,
-                   obs_timestamps: dict[str, float] | None = None) -> bytes:
+def encode_obs_request() -> bytes:
+    hdr = msgpack.packb({"type": "obs_request"})
+    return struct.pack("<I", len(hdr)) + hdr
+
+
+def encode_obs_response(obs: Observation) -> bytes:
+    return _encode_obs_frame("obs_response", obs, {})
+
+
+def decode_obs_response(data: bytes) -> Observation:
+    obs, _ = _decode_obs_frame(data)
+    return obs
+
+
+# ── apply_action (fire-and-forget) ────────────────────────────────────────────
+
+def encode_apply_action(
+    action: np.ndarray,
+    obs_timestamps: dict[str, float] | None = None,
+) -> bytes:
     action = np.asarray(action, dtype=np.float32)
     header = msgpack.packb({
-        "type": "action",
+        "type": "apply_action",
         "shape": list(action.shape),
         "dtype": action.dtype.name,
         "obs_timestamps": obs_timestamps or {},
@@ -181,35 +202,9 @@ def encode_action(action: np.ndarray,
     return struct.pack("<I", len(header)) + header + action.tobytes()
 
 
-def decode_action(data: bytes) -> tuple[np.ndarray, dict[str, float]]:
+def decode_apply_action(data: bytes) -> tuple[np.ndarray, dict[str, float]]:
     (hlen,) = struct.unpack_from("<I", data, 0)
     header = msgpack.unpackb(data[4:4 + hlen], raw=False)
     arr = np.frombuffer(data[4 + hlen:], dtype=header["dtype"]).reshape(header["shape"]).copy()
     obs_timestamps = {k: float(v) for k, v in header.get("obs_timestamps", {}).items()}
     return arr, obs_timestamps
-
-
-def encode_step_response(
-    obs: Observation,
-    reward: float,
-    terminated: bool,
-    truncated: bool,
-    info: dict,
-) -> bytes:
-    return _encode_obs_frame("step_response", obs, {
-        "reward": reward,
-        "terminated": terminated,
-        "truncated": truncated,
-        "info": info,
-    })
-
-
-def decode_step_response(data: bytes) -> tuple[Observation, float, bool, bool, dict]:
-    obs, header = _decode_obs_frame(data)
-    return (
-        obs,
-        float(header.get("reward", 0.0)),
-        bool(header.get("terminated", False)),
-        bool(header.get("truncated", False)),
-        header.get("info", {}),
-    )

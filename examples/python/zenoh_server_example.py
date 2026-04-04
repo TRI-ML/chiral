@@ -1,4 +1,4 @@
-"""Example environment server using Zenoh transport.
+"""Example robot server using Zenoh transport and the streaming (decoupled) API.
 
 Run first, then start zenoh_client_example.py:
 
@@ -81,20 +81,25 @@ class MyRobotServer(chiral.PolicyServer):
         self._t_sum = 0.0
         return self._make_obs(), {}
 
-    async def step(self, action: np.ndarray) -> tuple[chiral.Observation, float, bool, bool, dict]:
+    async def get_obs(self) -> chiral.Observation:
+        """Return a snapshot of the current sensor state."""
+        return self._make_obs()
+
+    async def apply_action(self, action: np.ndarray) -> None:
         t0 = time.perf_counter()
-        obs = self._make_obs(timestamp=self._step * 0.05)
+
+        # ── hardware command goes here ─────────────────────────────────────
+        # robot.send_joint_command(action)
+        # ──────────────────────────────────────────────────────────────────
+
         step_ms = (time.perf_counter() - t0) * 1e3
         self._step  += 1
         self._t_sum += step_ms
 
-        print(f"step={self._step:4d}  "
-              f"server_step={step_ms:5.2f}ms  "
+        print(f"action={self._step:4d}  "
+              f"apply={step_ms:5.2f}ms  "
               f"avg={self._t_sum / self._step:5.2f}ms",
               flush=True)
-
-        terminated = self._step >= 200
-        return obs, 0.0, terminated, False, {}
 
 
 if __name__ == "__main__":

@@ -8,10 +8,10 @@ import websockets
 import zenoh
 
 from .protocol import (
-    decode_action,
+    decode_apply_action,
     encode_metadata_response,
+    encode_obs_response,
     encode_reset_response,
-    encode_step_response,
     peek_type,
 )
 from .types import CameraConfig, CameraInfo, Observation, ProprioConfig
@@ -21,15 +21,16 @@ class PolicyServer(ABC):
     """
     Abstract server — robot/environment side.
 
-    Subclass and implement ``camera_configs``, ``reset``, and ``step``,
-    then call ``run()`` (blocking) or ``await serve()`` (async).
+    Subclass and implement ``camera_configs``, ``reset``, and
+    ``apply_action``, then call ``run()`` (blocking) or ``await serve()``
+    (async).
 
     The base class calls ``camera_configs()`` once at init time and
-    pre-allocates ``self.images`` and ``self.depths`` so that sensor
-    drivers can fill them in-place without per-step allocation.
-
-    The client drives the loop: it sends a reset request first, then
-    repeatedly sends actions and receives step responses.
+    pre-allocates ``self.images``, ``self.depths``, and ``self.proprios``
+    so that sensor drivers can fill them in-place without per-step
+    allocation.  Override ``get_obs()`` to customise how observations are
+    assembled; the default implementation snapshots all pre-allocated
+    buffers via ``_make_obs()``.
 
     Pass ``protocol="zenoh"`` to use Zenoh pub/sub instead of WebSocket.
     The ``host`` and ``port`` arguments are used for both transports:
@@ -189,13 +190,26 @@ class PolicyServer(ABC):
 
     @abstractmethod
     async def reset(self) -> tuple[Observation, dict]:
-        """Reset the environment and return (observation, info)."""
+        """Reset the robot/environment and return (observation, info)."""
+
+    async def get_obs(self) -> Observation:
+        """Return the current observation in response to an ``obs_request``.
+
+        Called by the client's obs stream thread (``start_obs_stream``).
+        Default implementation snapshots all pre-allocated buffers via
+        ``_make_obs()``. Override to block until a fresh frame arrives or
+        to assemble the observation differently.
+        """
+        return self._make_obs()
 
     @abstractmethod
-    async def step(
-        self, action: np.ndarray
-    ) -> tuple[Observation, float, bool, bool, dict]:
-        """Step the environment and return (obs, reward, terminated, truncated, info)."""
+    async def apply_action(self, action: np.ndarray) -> None:
+        """Apply a single action slice to the robot/environment.
+
+        Called by the client's action dispatch thread
+        (``start_action_dispatch``) at a fixed Hz. No response is sent —
+        observations are obtained independently via ``get_obs``.
+        """
 
     # ── WebSocket transport ───────────────────────────────────────────────────
 
@@ -216,12 +230,14 @@ class PolicyServer(ABC):
                     obs, info = await self.reset()
                     await websocket.send(encode_reset_response(obs, info))
 
-                elif msg_type == "action":
-                    action, _ = decode_action(raw)
-                    obs, reward, terminated, truncated, info = await self.step(action)
-                    await websocket.send(
-                        encode_step_response(obs, reward, terminated, truncated, info)
-                    )
+                elif msg_type == "obs_request":
+                    obs = await self.get_obs()
+                    await websocket.send(encode_obs_response(obs))
+
+                elif msg_type == "apply_action":
+                    action, _ = decode_apply_action(raw)
+                    await self.apply_action(action)
+                    # no response — fire-and-forget
 
         except websockets.ConnectionClosed:
             pass
@@ -257,10 +273,14 @@ class PolicyServer(ABC):
                     obs, info = await self.reset()
                     pub.put(encode_reset_response(obs, info))
 
-                elif msg_type == "action":
-                    action, _ = decode_action(raw)
-                    obs, reward, terminated, truncated, info = await self.step(action)
-                    pub.put(encode_step_response(obs, reward, terminated, truncated, info))
+                elif msg_type == "obs_request":
+                    obs = await self.get_obs()
+                    pub.put(encode_obs_response(obs))
+
+                elif msg_type == "apply_action":
+                    action, _ = decode_apply_action(raw)
+                    await self.apply_action(action)
+                    # no response — fire-and-forget
 
         finally:
             sub.undeclare()

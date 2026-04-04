@@ -1,4 +1,7 @@
-"""Example environment server.
+"""Example robot server using the streaming (decoupled) API.
+
+Observations are served on demand via get_obs(); actions arrive
+independently via apply_action() dispatched at a fixed Hz by the client.
 
 Run first, then start client_example.py:
 
@@ -72,9 +75,8 @@ class MyRobotServer(chiral.PolicyServer):
             self.update_depth(name, new_depth)
 
             # Update extrinsics every frame for moving cameras (e.g. wrist).
-            # In real code: T = fk_solver.compute(joint_positions)
             T = np.eye(4, dtype=np.float64)
-            T[0, 3] = 0.1 * np.sin(t)   # simulated oscillating translation
+            T[0, 3] = 0.1 * np.sin(t)  # simulated oscillating translation
             self.update_extrinsics(name, T)
 
             t += 1 / 30
@@ -83,10 +85,8 @@ class MyRobotServer(chiral.PolicyServer):
     def _proprio_loop(self, name: str) -> None:
         """Simulates a proprioception driver running at ~500 Hz."""
         while self._running:
-            # ── hardware read goes here ────────────────────────────────────
-            # state = robot.read_joints()  # np.ndarray shape (DOF,)
+            # state = robot.read_joints()
             # self.update_proprio(name, state)
-            # ──────────────────────────────────────────────────────────────
             time.sleep(1 / 500)
 
     async def get_metadata(self) -> dict:
@@ -97,23 +97,26 @@ class MyRobotServer(chiral.PolicyServer):
         self._t_sum = 0.0
         return self._make_obs(), {}
 
-    async def step(self, action: np.ndarray) -> tuple[chiral.Observation, float, bool, bool, dict]:
+    async def get_obs(self) -> chiral.Observation:
+        """Return a snapshot of the current sensor state."""
+        return self._make_obs()
+
+    async def apply_action(self, action: np.ndarray) -> None:
+        """Receive one action slice from the client and apply it to the robot."""
         t0 = time.perf_counter()
 
-        # _make_obs() snapshots all camera and proprio buffers under their locks.
-        obs = self._make_obs(timestamp=self._step * 0.05)
+        # ── hardware command goes here ─────────────────────────────────────
+        # robot.send_joint_command(action)
+        # ──────────────────────────────────────────────────────────────────
 
         step_ms = (time.perf_counter() - t0) * 1e3
         self._step  += 1
         self._t_sum += step_ms
 
-        print(f"step={self._step:4d}  "
-              f"server_step={step_ms:5.2f}ms  "
+        print(f"action={self._step:4d}  "
+              f"apply={step_ms:5.2f}ms  "
               f"avg={self._t_sum / self._step:5.2f}ms",
               flush=True)
-
-        terminated = self._step >= 200
-        return obs, 0.0, terminated, False, {}
 
 
 if __name__ == "__main__":

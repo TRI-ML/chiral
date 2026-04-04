@@ -1,6 +1,6 @@
 # Client Guide
 
-`PolicyClient` is the policy-side entry point. It connects over WebSocket to a running `PolicyServer` and exposes a gym-like `reset` / `step` interface. All network I/O is handled internally; your policy code sees only synchronous Python calls or blocking C++ calls.
+`PolicyClient` is the policy-side entry point. It connects over WebSocket (or Zenoh) to a running `PolicyServer`. Observations and actions flow on independent background threads so chunked policy predictions never block waiting for camera data. All network I/O is handled internally.
 
 ---
 
@@ -121,43 +121,53 @@ This means you can start the client before the server is ready — it will block
 
 ---
 
-## The reset/step Loop
+## Episode Loop
 
-The standard episode loop matches the OpenAI Gym / Gymnasium interface:
+The typical pattern uses three concurrent threads:
 
-1. Call `reset()` once to get the initial observation.
-2. Loop: run your policy on the current observation to produce an action, call `step(action)`, check the termination flags.
-3. When `terminated` or `truncated` is `True`, the episode is over.
+1. **Obs stream** (`start_obs_stream`) — polls the server at a fixed Hz and stores the latest observation in `latest_obs`.
+2. **Policy loop** (your code) — reads `latest_obs`, runs inference, and enqueues a chunk of actions with `put_action`.
+3. **Action dispatch** (`start_action_dispatch`) — dequeues one action at a time and sends it to the server at a fixed Hz.
+
+Because `apply_action` on the server is fire-and-forget (no response), the obs stream is never blocked by action sending.
 
 === "Python"
 
     ```python
+    import threading
     import numpy as np
     import chiral
 
+    CHUNK_SIZE = 10  # actions predicted per inference call
+
+    def policy_loop(env, stop):
+        while not stop.is_set():
+            obs = env.latest_obs
+            if obs is None:
+                continue
+            # Replace with real model inference:
+            actions = np.zeros([CHUNK_SIZE, 7], dtype=np.float32)
+            for a in actions:
+                env.put_action(a)
+
     with chiral.PolicyClient("ws://localhost:8765") as env:
         meta = env.get_metadata()
-        action_shape = meta.get("action_shape", [1, 7])
-
         obs, info = env.reset()
 
-        total_reward = 0.0
-        step = 0
+        env.start_obs_stream(hz=30)       # fetch obs at 30 Hz
+        env.start_action_dispatch(hz=10)  # dispatch one action per tick at 10 Hz
 
-        while True:
-            # Run your policy here.  Replace with real model inference.
-            action = np.zeros(action_shape, dtype=np.float32)
+        stop = threading.Event()
+        t = threading.Thread(target=policy_loop, args=(env, stop))
+        t.start()
 
-            obs, reward, terminated, truncated, info = env.step(action)
-            total_reward += reward
-            step += 1
-
-            if terminated or truncated:
-                print(f"Episode done: steps={step}  total_reward={total_reward:.2f}")
-                break
+        # Run for desired duration, then stop.
+        stop.set(); t.join()
     ```
 
 === "C++"
+
+    > **Note:** The C++ client still uses the legacy coupled `step()` API.
 
     ```cpp
     #include <chiral/client.hpp>
@@ -173,8 +183,7 @@ The standard episode loop matches the OpenAI Gym / Gymnasium interface:
 
         auto [obs, info] = env.reset();
 
-        float total_reward = 0.f;
-        int   step         = 0;
+        int step = 0;
 
         while (true) {
             // Run your policy here.  Replace with real model inference.
@@ -184,13 +193,11 @@ The standard episode loop matches the OpenAI Gym / Gymnasium interface:
             action.data.assign(N * D, 0.f);
 
             auto res = env.step(action);
-            obs           = std::move(res.obs);
-            total_reward += res.reward;
+            obs = std::move(res.obs);
             ++step;
 
             if (res.terminated || res.truncated) {
-                std::printf("Episode done: steps=%d  total_reward=%.2f\n",
-                            step, total_reward);
+                std::printf("Episode done: steps=%d\n", step);
                 break;
             }
         }
